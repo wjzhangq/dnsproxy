@@ -83,7 +83,6 @@ func intervalSaveCache() {
 	}()
 }
 
-
 func loadCfg() {
 	MyMap := make(map[string]string)
 
@@ -114,19 +113,17 @@ func loadCfg() {
 
 		my_ip := s[0]
 
-		for i:=1; i < n; i++ {
+		for i := 1; i < n; i++ {
 			tmp_row := strings.TrimSpace(s[i])
 			if len(tmp_row) == 0 {
 				continue
 			}
 			MyMap[tmp_row] = my_ip
 		}
-
-
-		log.Println(MyMap)
 	}
 
 	localMap = MyMap
+	log.Println("load map ok")
 }
 
 func init() {
@@ -242,24 +239,30 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 
 	//check local map
 	dom := req.Question[0].Name
-	domain := dom[:-1]
+	domain := dom[0 : len(dom)-1]
+
 	v, ok := localMap[domain]
+
 	if ok {
 		tm := new(dns.Msg)
-		tm.Id = id
+		tm.Id = req.Id
 		tm.Answer = make([]dns.RR, 1)
 		dom := req.Question[0].Name
 		trr := new(dns.A)
 		trr.Hdr = dns.RR_Header{Name: dom, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 5}
-		trr.A = net.IPv4(127, 0, 0, 1)
+		trr.A = net.ParseIP(v)
 		tm.Answer[0] = trr
 
 		err = w.WriteMsg(tm)
+
+		if DEBUG > 0 {
+			log.Printf("hosts:%v ip:%v\n", domain, v)
+		}
+
 		goto end
 	}
 
 	req.Question = questions
-
 	id = req.Id
 
 	req.Id = 0

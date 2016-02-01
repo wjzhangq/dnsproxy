@@ -1,3 +1,7 @@
+##编译为window代码：
+ - GOOS=windows GOARCH=amd64 go build dnsproxy1.go 
+ - windows后台运行：E:\src\dns>start /b dnsproxy1.exe -debug=1 -dns=10.16.0.222:53:udp,192.168.0.222:53:udp,8.8.8.8:53:udp,8.8.4.4:53:udp,8.8.8.8:53:tcp,8.8.4.4:53:tcp > log.log 2>&1
+
 ##Proxy DNS query use TCP in go lang
 
 苦于本地DNS污染，连github.com这种都经常解析不了。最近愈发频繁，所以写了这个程序。
