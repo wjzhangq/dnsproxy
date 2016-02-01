@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"crypto/md5"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"github.com/miekg/dns"
 	"github.com/pmylund/go-cache"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -26,6 +28,7 @@ var (
 	encache = flag.Bool("cache", true, "enable go-cache")
 	expire  = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use doamin ttl time")
 	file    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "cache.dat"), "cached file")
+	cfg     = flag.String("cfg", filepath.Join(path.Dir(os.Args[0]), "hosts.cfg"), "local host file")
 	ipv6    = flag.Bool("6", false, "skip ipv6 record query AAAA")
 	timeout = flag.Int("timeout", 200, "read/write timeout")
 
@@ -34,6 +37,8 @@ var (
 
 	DEBUG   int
 	ENCACHE bool
+
+	localMap map[string]string
 
 	DNS [][]string
 
@@ -52,11 +57,12 @@ func intervalSaveCache() {
 	save := func() {
 		err := conn.SaveFile(*file)
 		if err == nil {
-			log.Printf("cache saved: %s\n", *file)
+			log.Printf("cache save: %s\n", *file)
 		} else {
 			log.Printf("cache save failed: %s, %s\n", *file, err)
 		}
 	}
+
 	go func() {
 		for {
 			select {
@@ -69,11 +75,58 @@ func intervalSaveCache() {
 					log.Println("recv SIGHUP clear cache")
 					conn.Flush()
 				}
-			case <-time.After(time.Second * 60):
+			case <-time.After(time.Second * 10):
 				save()
+				loadCfg()
 			}
 		}
 	}()
+}
+
+
+func loadCfg() {
+	MyMap := make(map[string]string)
+
+	f, err := os.Open(*cfg)
+	if err != nil {
+		log.Printf("cfg %s load failure!", *cfg)
+		return
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	for {
+		b, _, err := r.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Printf("cfg read failure! %v", err)
+			break
+		}
+
+		s := strings.Split(strings.TrimSpace(string(b)), " ")
+		n := len(s)
+		if n < 2 {
+			log.Printf("cfg error line %v", b)
+			continue
+		}
+
+		my_ip := s[0]
+
+		for i:=1; i < n; i++ {
+			tmp_row := strings.TrimSpace(s[i])
+			if len(tmp_row) == 0 {
+				continue
+			}
+			MyMap[tmp_row] = my_ip
+		}
+
+
+		log.Println(MyMap)
+	}
+
+	localMap = MyMap
 }
 
 func init() {
@@ -94,6 +147,8 @@ func init() {
 	clientUDP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
 	clientUDP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
 
+	loadCfg()
+
 	if ENCACHE {
 		conn = cache.New(time.Second*time.Duration(*expire), time.Second*60)
 		conn.LoadFile(*file)
@@ -105,19 +160,23 @@ func init() {
 		if s == "" {
 			continue
 		}
+
 		dns := s
 		proto := "udp"
 		parts := strings.Split(s, ":")
+
 		if len(parts) > 2 {
 			dns = strings.Join(parts[:2], ":")
 			if parts[2] == "tcp" {
 				proto = "tcp"
 			}
 		}
+
 		_, err := net.ResolveTCPAddr("tcp", dns)
 		if err != nil {
 			log.Fatalf("wrong dns address %s\n", dns)
 		}
+
 		DNS = append(DNS, []string{dns, proto})
 	}
 
@@ -141,8 +200,7 @@ func main() {
 		failure <- dns.ListenAndServe(*local, "udp", nil)
 	}(failure)
 
-	log.Printf("ready for accept connection on tcp/udp %s ...\n", *local)
-
+	log.Printf("ready for accept connection on tcp/upd %s ...\n", *local)
 	fmt.Println(<-failure)
 }
 
@@ -165,7 +223,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		}
 	}()
 
-	if req.MsgHdr.Response == true { // supposed responses sent to us are bogus
+	if req.MsgHdr.Response == true {
 		return
 	}
 
@@ -182,6 +240,24 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	//check local map
+	dom := req.Question[0].Name
+	domain := dom[:-1]
+	v, ok := localMap[domain]
+	if ok {
+		tm := new(dns.Msg)
+		tm.Id = id
+		tm.Answer = make([]dns.RR, 1)
+		dom := req.Question[0].Name
+		trr := new(dns.A)
+		trr.Hdr = dns.RR_Header{Name: dom, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 5}
+		trr.A = net.IPv4(127, 0, 0, 1)
+		tm.Answer[0] = trr
+
+		err = w.WriteMsg(tm)
+		goto end
+	}
+
 	req.Question = questions
 
 	id = req.Id
@@ -194,6 +270,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 		if reply, ok := conn.Get(key); ok {
 			data, _ = reply.([]byte)
 		}
+
 		if data != nil && len(data) > 0 {
 			m = &dns.Msg{}
 			m.Unpack(data)
@@ -201,7 +278,7 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 			err = w.WriteMsg(m)
 
 			if DEBUG > 0 {
-				log.Printf("id: %5d cache: HIT %v\n", id, query)
+				log.Printf("id:%5d cache: HIT %v\n", id, query)
 			}
 
 			goto end
@@ -215,19 +292,24 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	for i, parts := range DNS {
 		dns := parts[0]
 		proto := parts[1]
+
 		tried = i > 0
+
 		if DEBUG > 0 {
 			if tried {
-				log.Printf("id: %5d try: %v %s %s\n", id, query, dns, proto)
+				log.Printf("id: 5%d try: %v %s %s\n", id, query, dns, proto)
 			} else {
-				log.Printf("id: %5d resolve: %v %s %s\n", id, query, dns, proto)
+				log.Printf("id: 5%d resolve: %v %s %s\n", id, query, dns, proto)
 			}
 		}
+
 		client := clientUDP
 		if proto == "tcp" {
 			client = clientTCP
 		}
+
 		m, _, err = client.Exchange(req, dns)
+
 		if err == nil && len(m.Answer) > 0 {
 			used = dns
 			break
@@ -244,7 +326,9 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 				}
 			}
 		}
+
 		data, err = m.Pack()
+
 		if err == nil {
 			_, err = w.Write(data)
 
@@ -253,13 +337,16 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 					m.Id = 0
 					data, _ = m.Pack()
 					ttl := 0
+
 					if len(m.Answer) > 0 {
 						ttl = int(m.Answer[0].Header().Ttl)
+
 						if ttl < 0 {
 							ttl = 0
 						}
 					}
 					conn.Set(key, data, time.Second*time.Duration(ttl))
+
 					m.Id = id
 					if DEBUG > 0 {
 						log.Printf("id: %5d cache: CACHED %v TTL %v\n", id, query, ttl)
@@ -272,15 +359,17 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 end:
 	if DEBUG > 1 {
 		fmt.Println(req)
+
 		if m != nil {
 			fmt.Println(m)
 		}
 	}
+
 	if err != nil {
 		log.Printf("id: %5d error: %v %s\n", id, query, err)
 	}
 
 	if DEBUG > 1 {
-		fmt.Println("====================================================")
+		fmt.Println("======================================")
 	}
 }
